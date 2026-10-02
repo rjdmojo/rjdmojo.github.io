@@ -175,9 +175,9 @@
   }
   .work-tab.active{ background:var(--ink); color:var(--bg); border-color:var(--ink) !important; }
 
-  /* ---------- reel carousel: auto-loop + drag / swipe / arrows ---------- */
+  /* ---------- reel carousel: endless loop + drag / swipe / arrows ---------- */
   .carousel-viewport{
-    overflow-x:auto; overflow-y:hidden; margin:0 -32px; padding:0 32px;
+    overflow-x:auto; overflow-y:hidden; padding:0 32px;
     scrollbar-width:none; -ms-overflow-style:none;
     cursor:grab; -webkit-overflow-scrolling:touch;
     -webkit-mask-image:linear-gradient(to right, transparent, #000 6%, #000 94%, transparent);
@@ -186,7 +186,6 @@
   .carousel-viewport::-webkit-scrollbar{ display:none; }
   .carousel-viewport.dragging{ cursor:grabbing; user-select:none; -webkit-user-select:none; }
   .carousel-track{ display:flex; gap:18px; width:max-content; }
-  .carousel-track.no-loop{ margin-left:120px; }
 
   .carousel-card{
     position:relative; flex:0 0 auto; width:230px; aspect-ratio:9/16;
@@ -717,9 +716,10 @@ function carouselCardHTML(item){
   if(!item){
     return `<div class="carousel-card"><div class="carousel-empty"><span class="plus">+</span><small>Add a video — edit WORK_ITEMS</small></div></div>`;
   }
+  // videos start paused; the IntersectionObserver below plays only the ones on screen
   const media = item.type === "youtube"
     ? `<iframe src="${ytEmbed(item.src, {autoplay:true, mute:true, loop:true, controls:false})}" allow="autoplay; encrypted-media" loading="lazy"></iframe>`
-    : `<video src="${item.src}" autoplay muted loop playsinline preload="metadata"></video>`;
+    : `<video src="${item.src}" muted loop playsinline preload="metadata"></video>`;
   return `
     <div class="carousel-card" data-idx="${item._idx}">
       ${media}
@@ -731,23 +731,63 @@ function carouselCardHTML(item){
     </div>`;
 }
 
-function renderCarousel(filter){
-  const track = document.getElementById("carouselTrack");
-  const viewport = document.querySelector(".carousel-viewport");
+/* ---------------- Carousel state ---------------- */
+const CARD_W = 230, CARD_GAP = 18;          // must match the CSS
+const CAR_SPEED = 41;                       // auto-scroll px per second
+const carViewport = document.querySelector(".carousel-viewport");
+const carTrack = document.getElementById("carouselTrack");
+let carPos = 0, carResumeAt = 0, carHover = false, carMouseDrag = false, carTouch = false;
+let carMoved = false, carLast = 0, carAnim = null, carObserver = null;
 
+function carPause(ms = 2200){ carResumeAt = performance.now() + ms; }
+
+function renderCarousel(filter){
   const items = WORK_ITEMS
     .filter(i => filter === "all" || (Array.isArray(i.category) ? i.category.includes(filter) : i.category === filter))
     .map((it,i) => ({...it, _idx:i}));
 
   const source = items.length ? items : new Array(PLACEHOLDER_SLOTS).fill(null);
 
-  // ALL = 3 copies so it can loop seamlessly in both directions
-  const displayItems = filter === "all" ? source.concat(source, source) : source;
+  // One "set" must be at least as wide as the screen, otherwise the loop shows gaps.
+  // Tabs with only 1–2 videos get repeated inside the set to fill the width.
+  const vw = carViewport.clientWidth || window.innerWidth;
+  const perSet = Math.ceil(vw / (CARD_W + CARD_GAP)) + 1;
+  const reps = Math.max(1, Math.ceil(perSet / source.length));
+  let set = [];
+  for(let r = 0; r < reps; r++) set = set.concat(source);
 
-  track.innerHTML = displayItems.map(carouselCardHTML).join("");
-  track.classList.toggle("no-loop", filter !== "all");
+  // 3 identical sets → seamless loop in BOTH directions (so you can scroll back too)
+  const displayItems = set.concat(set, set);
+  track_render(displayItems, items);
 
-  track.querySelectorAll(".carousel-card[data-idx]").forEach(card => {
+  // start in the middle set
+  carAnim = null;
+  carViewport.scrollLeft = 0;
+  const half = (carTrack.scrollWidth + CARD_GAP) / 3;
+  carViewport.scrollLeft = half;
+  carPos = carViewport.scrollLeft;
+  carPause(800);
+}
+
+function track_render(displayItems, items){
+  if(carObserver){ carObserver.disconnect(); carObserver = null; }
+  carTrack.innerHTML = displayItems.map(carouselCardHTML).join("");
+
+  // play only the videos that are actually visible (much lighter on phones & slow networks)
+  if("IntersectionObserver" in window){
+    carObserver = new IntersectionObserver((entries) => {
+      entries.forEach(en => {
+        const v = en.target;
+        if(en.isIntersecting){ const p = v.play(); if(p && p.catch) p.catch(()=>{}); }
+        else { v.pause(); }
+      });
+    }, { root:null, threshold:0.01 });
+    carTrack.querySelectorAll("video").forEach(v => carObserver.observe(v));
+  } else {
+    carTrack.querySelectorAll("video").forEach(v => { const p = v.play(); if(p && p.catch) p.catch(()=>{}); });
+  }
+
+  carTrack.querySelectorAll(".carousel-card[data-idx]").forEach(card => {
     const item = items[card.dataset.idx];
     if(!item) return;
     card.addEventListener("click", () => { if(!carMoved) openLightbox(item); });
@@ -762,79 +802,102 @@ function renderCarousel(filter){
     }
   });
 
-  // start in the middle copy (loop) or at the start (filtered tabs)
-  viewport.scrollLeft = 0;
-  if(filter === "all"){
-    viewport.scrollLeft = (track.scrollWidth + 18) / 3;
+  // re-attach the big cursor effect to the freshly built cards
+  const cursorEl = document.getElementById("cursor");
+  if(hasHover && !reduceMotion && cursorEl){
+    carTrack.querySelectorAll(".carousel-card").forEach(el => {
+      el.addEventListener("mouseenter", () => cursorEl.classList.add("grow"));
+      el.addEventListener("mouseleave", () => cursorEl.classList.remove("grow"));
+    });
   }
-  carPos = viewport.scrollLeft;
 }
 
-/* ---------------- Carousel: auto-loop + drag / swipe / arrows ---------------- */
-let carPos = 0, carResumeAt = 0, carHover = false, carDragging = false, carMoved = false, carLast = 0;
-const carViewport = document.querySelector(".carousel-viewport");
-const carTrack = document.getElementById("carouselTrack");
-const CAR_SPEED = 41; // px per second (same pace as before)
-
-function carPause(ms = 2200){ carResumeAt = performance.now() + ms; }
-
+/* ---------------- Carousel loop engine ---------------- */
 function carTick(now){
   const dt = Math.min(0.05, (now - (carLast || now)) / 1000);
   carLast = now;
-  if(!carTrack.classList.contains("no-loop")){
-    const half = (carTrack.scrollWidth + 18) / 3; // width of one full set
-    if(half > 200){
-      const auto = !reduceMotion && !carHover && !carDragging && now > carResumeAt;
-      let sl = auto ? carPos + CAR_SPEED * dt : carViewport.scrollLeft;
-      let wrapped = false;
-      if(sl >= 2 * half){ sl -= half; wrapped = true; }
-      else if(sl < half){ sl += half; wrapped = true; }
-      if(auto || wrapped) carViewport.scrollLeft = sl;
-      carPos = sl;
+
+  const half = (carTrack.scrollWidth + CARD_GAP) / 3;   // width of one full set
+  if(half > 200){
+    let pos;
+
+    if(carMouseDrag || carTouch){
+      // the user is in control (mouse drag or finger swipe)
+      carAnim = null;
+      pos = carViewport.scrollLeft;
+    } else if(carAnim){
+      // arrow-button glide
+      const t = Math.min(1, (now - carAnim.start) / carAnim.dur);
+      const e = 1 - Math.pow(1 - t, 3);
+      pos = carAnim.from + (carAnim.to - carAnim.from) * e;
+      carViewport.scrollLeft = pos;
+      if(t >= 1) carAnim = null;
+    } else if(!reduceMotion && !carHover && now > carResumeAt){
+      // automatic slow loop
+      pos = carPos + CAR_SPEED * dt;
+      carViewport.scrollLeft = pos;
+    } else {
+      pos = carViewport.scrollLeft;
     }
+
+    // infinite loop: jump by exactly one set so the jump is invisible
+    let shift = 0;
+    if(pos >= 2 * half) shift = -half;
+    else if(pos < half) shift = half;
+    if(shift){
+      pos += shift;
+      if(carAnim){ carAnim.from += shift; carAnim.to += shift; }
+      carViewport.scrollLeft = pos;
+    }
+    carPos = pos;
   }
   requestAnimationFrame(carTick);
 }
 requestAnimationFrame(carTick);
 
-// hover pauses (desktop)
-carViewport.addEventListener("mouseenter", () => carHover = true);
-carViewport.addEventListener("mouseleave", () => carHover = false);
+// hover pauses (only on devices that really have a mouse)
+if(hasHover){
+  carViewport.addEventListener("mouseenter", () => carHover = true);
+  carViewport.addEventListener("mouseleave", () => carHover = false);
+}
 
 // mouse drag
 let dragStartX = 0, dragStartScroll = 0;
 carViewport.addEventListener("mousedown", (e) => {
-  carDragging = true; carMoved = false;
+  carMouseDrag = true; carMoved = false; carAnim = null;
   dragStartX = e.clientX; dragStartScroll = carViewport.scrollLeft;
   carViewport.classList.add("dragging");
 });
 window.addEventListener("mousemove", (e) => {
-  if(!carDragging) return;
+  if(!carMouseDrag) return;
   const dx = e.clientX - dragStartX;
   if(Math.abs(dx) > 5) carMoved = true;
   carViewport.scrollLeft = dragStartScroll - dx;
 });
 window.addEventListener("mouseup", () => {
-  if(!carDragging) return;
-  carDragging = false; carPause();
+  if(!carMouseDrag) return;
+  carMouseDrag = false; carPause(2500);
   carViewport.classList.remove("dragging");
   setTimeout(() => carMoved = false, 0);
 });
 
-// touch swipe (native scrolling) + trackpad / wheel
-carViewport.addEventListener("touchstart", () => { carDragging = true; carMoved = false; }, {passive:true});
+// touch swipe (native scrolling) + trackpad / mouse wheel
+carViewport.addEventListener("touchstart", () => { carTouch = true; carMoved = false; carAnim = null; }, {passive:true});
 carViewport.addEventListener("touchmove", () => { carMoved = true; }, {passive:true});
-carViewport.addEventListener("touchend", () => { carDragging = false; carPause(3000); setTimeout(() => carMoved = false, 0); }, {passive:true});
-carViewport.addEventListener("wheel", () => carPause(), {passive:true});
+carViewport.addEventListener("touchend", () => { carTouch = false; carPause(3500); setTimeout(() => carMoved = false, 0); }, {passive:true});
+carViewport.addEventListener("touchcancel", () => { carTouch = false; carPause(3500); }, {passive:true});
+carViewport.addEventListener("wheel", () => { carAnim = null; carPause(2500); }, {passive:true});
 
-// arrow buttons
+// arrow buttons — smooth glide that keeps working across the loop point
 function carStep(dir){
-  carPause(3000);
-  carViewport.scrollBy({ left: dir * 480, behavior: "smooth" });
+  carPause(3500);
+  const from = carViewport.scrollLeft;
+  carAnim = { from, to: from + dir * (CARD_W + CARD_GAP) * 2, start: performance.now(), dur: 550 };
 }
 document.getElementById("carPrev").addEventListener("click", () => carStep(-1));
 document.getElementById("carNext").addEventListener("click", () => carStep(1));
 
+// tabs
 document.getElementById("workTabs").addEventListener("click", (e) => {
   const btn = e.target.closest(".work-tab");
   if(!btn) return;
@@ -1025,7 +1088,7 @@ if(hasHover && !reduceMotion){
   } else {
     window.addEventListener("mousemove", (e) => { cursor.style.left = e.clientX+"px"; cursor.style.top = e.clientY+"px"; });
   }
-  document.querySelectorAll('[data-cursor-link], .carousel-card, .btn').forEach(el => {
+  document.querySelectorAll('[data-cursor-link], .btn').forEach(el => {
     el.addEventListener("mouseenter", () => cursor.classList.add("grow"));
     el.addEventListener("mouseleave", () => cursor.classList.remove("grow"));
   });
